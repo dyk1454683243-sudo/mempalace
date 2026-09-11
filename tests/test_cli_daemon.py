@@ -1257,6 +1257,21 @@ class TestCmdRoomsDaemon:
 # ── search provenance rendering (techempower-org/mempalace#451) ─────────
 
 
+# Text fixtures for the near-duplicate ordering tests below. ``_NEAR_CLAIM``
+# appears verbatim in both the curated card and the transcript quoting it —
+# the real shape from the 2g corpus that #451 item F was measured on.
+_NEAR_CLAIM = (
+    "the five handsets refused one cell and the fault was never inside "
+    "their modems because a documented refuser camped and carried a call"
+)
+CARD = "REFUTED 2026-09-06 " + _NEAR_CLAIM + " this correction supersedes the headline"
+TRANSCRIPT = "and then I told the team " + _NEAR_CLAIM + " which is what the log shows"
+UNRELATED = (
+    "the postgres backend scrubs lone surrogates and nul bytes at every bind "
+    "site so a mined corpus cannot abort the whole batch on one stray byte"
+)
+
+
 class TestCmdSearchProvenance:
     """Every search hit carries ``source_kind`` and, when the CLI can tell,
     ``source_stale`` — and the renderers say so.
@@ -1418,6 +1433,231 @@ class TestCmdSearchProvenance:
 
         hit = {"source_kind": "transcript", "source_stale": True}
         assert cli._provenance_tag(hit) == " ⟨transcript⟩"
+
+    def test_fast_route_orders_curated_above_its_near_duplicate(self, capsys):
+        """#451 item F, FAIL-D: on bm25-fast the curated card measured rank 13
+        while a transcript quoting it sat at rank 1."""
+        from mempalace import cli
+
+        payload = {
+            "results": [
+                {
+                    "id": "t",
+                    "wing": "2g",
+                    "room": "problems",
+                    "snippet": TRANSCRIPT,
+                    "source_file": "/p/s.jsonl",
+                    "rank": 0.051,
+                },
+                {
+                    "id": "f",
+                    "wing": "2g",
+                    "room": "problems",
+                    "snippet": CARD,
+                    "source_file": "/p/CLAUDE.md",
+                    "rank": 0.017,
+                },
+            ]
+        }
+        env = {"PALACE_DAEMON_URL": "http://daemon.example:8085"}
+        with (
+            patch.dict("os.environ", env, clear=True),
+            patch("mempalace.cli._call_daemon_rest", return_value=payload),
+        ):
+            with pytest.raises(SystemExit):
+                cli.cmd_search(self._args(fmt="json", results=2))
+        out = json.loads(capsys.readouterr().out)
+        assert [h["id"] for h in out["results"]] == ["f", "t"]
+
+    def test_fast_route_leaves_transcript_only_recall_alone(self, capsys):
+        """THE BOUND, at the route level: no curated near-duplicate, no reorder."""
+        from mempalace import cli
+
+        payload = {
+            "results": [
+                {
+                    "id": "t",
+                    "wing": "2g",
+                    "room": "p",
+                    "snippet": UNRELATED,
+                    "source_file": "/p/s.jsonl",
+                    "rank": 0.051,
+                },
+                {
+                    "id": "f",
+                    "wing": "2g",
+                    "room": "p",
+                    "snippet": CARD,
+                    "source_file": "/p/CLAUDE.md",
+                    "rank": 0.017,
+                },
+            ]
+        }
+        env = {"PALACE_DAEMON_URL": "http://daemon.example:8085"}
+        with (
+            patch.dict("os.environ", env, clear=True),
+            patch("mempalace.cli._call_daemon_rest", return_value=payload),
+        ):
+            with pytest.raises(SystemExit):
+                cli.cmd_search(self._args(fmt="json", results=2))
+        out = json.loads(capsys.readouterr().out)
+        assert [h["id"] for h in out["results"]] == ["t", "f"]
+
+    def test_mcp_envelope_route_applies_the_preference(self, capsys):
+        from mempalace import cli
+
+        envelope = {
+            "results": [
+                {
+                    "id": "t",
+                    "wing": "2g",
+                    "room": "p",
+                    "text": TRANSCRIPT,
+                    "source_file": "s.jsonl",
+                },
+                {"id": "f", "wing": "2g", "room": "p", "text": CARD, "source_file": "CLAUDE.md"},
+            ]
+        }
+        args = self._args(fmt="json")
+        args.room = "p"
+        env = {"PALACE_DAEMON_URL": "http://daemon.example:8085"}
+        with (
+            patch.dict("os.environ", env, clear=True),
+            patch("mempalace.cli._call_daemon_tool", return_value=envelope),
+        ):
+            with pytest.raises(SystemExit):
+                cli.cmd_search(args)
+        out = json.loads(capsys.readouterr().out)
+        assert [h["id"] for h in out["results"]] == ["f", "t"]
+
+    # ── conditional widen (#451 item F, the fetched-window bound) ──────
+
+    @staticmethod
+    def _fast_payload_n(items):
+        return {"results": items}
+
+    @staticmethod
+    def _t(i, text):
+        return {
+            "id": f"t{i}",
+            "wing": "2g",
+            "room": "p",
+            "snippet": text,
+            "source_file": f"/p/s{i}.jsonl",
+            "rank": 0.05,
+        }
+
+    @staticmethod
+    def _f(i, text):
+        return {
+            "id": f"f{i}",
+            "wing": "2g",
+            "room": "p",
+            "snippet": text,
+            "source_file": "/p/CLAUDE.md",
+            "rank": 0.01,
+        }
+
+    def test_no_widen_when_a_curated_hit_is_already_present(self):
+        """THE COMMON CASE COSTS NOTHING: exactly one daemon call."""
+        from mempalace import cli
+
+        payload = self._fast_payload_n([self._t(1, UNRELATED), self._f(1, CARD)])
+        env = {"PALACE_DAEMON_URL": "http://daemon.example:8085"}
+        with (
+            patch.dict("os.environ", env, clear=True),
+            patch("mempalace.cli._call_daemon_rest", return_value=payload) as m,
+        ):
+            cli._daemon_search_fast("q", 2, wing="2g")
+        assert m.call_count == 1
+
+    def test_widens_once_when_nothing_curated_matched(self):
+        """The broken case pays exactly one extra call, at 2x the limit."""
+        from mempalace import cli
+
+        narrow = self._fast_payload_n([self._t(i, UNRELATED) for i in range(2)])
+        wide = self._fast_payload_n([self._t(i, UNRELATED) for i in range(3)] + [self._f(1, CARD)])
+        env = {"PALACE_DAEMON_URL": "http://daemon.example:8085"}
+        with (
+            patch.dict("os.environ", env, clear=True),
+            patch("mempalace.cli._call_daemon_rest", side_effect=[narrow, wide]) as m,
+        ):
+            cli._daemon_search_fast("q", 2, wing="2g")
+        assert m.call_count == 2
+        assert m.call_args_list[0].args[1]["limit"] == 2
+        assert m.call_args_list[1].args[1]["limit"] == 4
+
+    def test_widen_surfaces_a_curated_near_duplicate_inside_the_limit(self):
+        """The point of widening: the card sits outside the first window, is a
+        near-duplicate of a hit inside it, and must end up above the cut."""
+        from mempalace import cli
+
+        narrow = self._fast_payload_n([self._t(0, TRANSCRIPT), self._t(1, UNRELATED)])
+        wide = self._fast_payload_n(
+            [self._t(0, TRANSCRIPT), self._t(1, UNRELATED), self._t(2, UNRELATED), self._f(1, CARD)]
+        )
+        env = {"PALACE_DAEMON_URL": "http://daemon.example:8085"}
+        with (
+            patch.dict("os.environ", env, clear=True),
+            patch("mempalace.cli._call_daemon_rest", side_effect=[narrow, wide]),
+        ):
+            data = cli._daemon_search_fast("q", 2, wing="2g")
+        ids = [h["id"] for h in data["results"]]
+        assert ids[0] == "f1", f"curated hit must clear the cut, got {ids}"
+        assert len(ids) == 2, "result is truncated back to the requested limit"
+
+    def test_widen_that_finds_nothing_curated_still_reports_honestly(self, capsys):
+        """A widened window with no curated hit must leave the header firing."""
+        from mempalace import cli
+
+        narrow = self._fast_payload_n([self._t(i, UNRELATED) for i in range(2)])
+        wide = self._fast_payload_n([self._t(i, UNRELATED) for i in range(4)])
+        env = {"PALACE_DAEMON_URL": "http://daemon.example:8085"}
+        with (
+            patch.dict("os.environ", env, clear=True),
+            patch("mempalace.cli._call_daemon_rest", side_effect=[narrow, wide]),
+        ):
+            try:
+                cli.cmd_search(self._args(fmt="table", results=2))
+            except SystemExit:
+                pass
+        out = capsys.readouterr().out
+        assert "no curated document matched" in out, (
+            "a widened window that still found nothing curated must keep saying so"
+        )
+
+    def test_widen_tolerates_a_failed_second_call(self):
+        """The extra fetch is an optimisation; losing it must not lose the search."""
+        from mempalace import cli
+
+        narrow = self._fast_payload_n([self._t(i, UNRELATED) for i in range(2)])
+        env = {"PALACE_DAEMON_URL": "http://daemon.example:8085"}
+        with (
+            patch.dict("os.environ", env, clear=True),
+            patch("mempalace.cli._call_daemon_rest", side_effect=[narrow, cli.DaemonError("boom")]),
+        ):
+            data = cli._daemon_search_fast("q", 2, wing="2g")
+        assert len(data["results"]) == 2
+
+    def test_no_widen_when_the_limit_already_exceeds_the_cap(self):
+        """At a large limit the widened window would not be wider — skip it."""
+        from mempalace import cli
+
+        payload = self._fast_payload_n([self._t(i, UNRELATED) for i in range(3)])
+        env = {"PALACE_DAEMON_URL": "http://daemon.example:8085"}
+        with (
+            patch.dict("os.environ", env, clear=True),
+            patch("mempalace.cli._call_daemon_rest", return_value=payload) as m,
+        ):
+            cli._daemon_search_fast("q", 40, wing="2g")
+        assert m.call_count == 1
+
+    def test_compact_tag_marks_diary_hits(self):
+        """The table renderer gets a diary note; compact must not be the one
+        renderer that stays silent about an unciteable hit."""
+        from mempalace import cli
+
+        assert cli._provenance_tag({"source_kind": "diary"}) == " ⟨diary⟩"
 
     def test_compact_tag_reports_stale_for_a_curated_file(self):
         from mempalace import cli

@@ -57,6 +57,7 @@ from .provenance import (
     provenance_note,
     source_kind,
 )
+from .result_ordering import prefer_curated
 from .version import __version__
 
 
@@ -685,6 +686,7 @@ def _provenance_tag(hit: dict) -> str:
     """Short source-shape tag for ``--format compact`` (empty when unremarkable).
 
     ``⟨transcript⟩`` — a quoted copy from a session transcript.
+    ``⟨diary⟩`` — a palace-written summary with no file behind it.
     ``⟨stale⟩`` — the file on disk has been modified since it was indexed.
     Never both: a growing session transcript is expected, so ``⟨stale⟩`` is
     suppressed for transcripts exactly as ``provenance_note`` suppresses the
@@ -700,6 +702,8 @@ def _provenance_tag(hit: dict) -> str:
     flags = []
     if kind == "transcript":
         flags.append("transcript")
+    elif kind == "diary":
+        flags.append("diary")
     elif hit.get("source_stale") is True:
         flags.append("stale")
     return f" ⟨{','.join(flags)}⟩" if flags else ""
@@ -2609,9 +2613,43 @@ def _resolve_search_limit(args) -> int:
     return getattr(args, "results", 5)
 
 
-def _daemon_search_fast(query: str, n_results: int, wing: str = None) -> dict | None:
-    """BM25 fast path via GET /search/fast. Returns normalised data dict or None."""
-    rest_params = {"q": query, "limit": n_results}
+# Reordering can only promote a hit the ranker actually returned. On the
+# measured #451 case the curated card sat at rank 13 of 20 while the reader
+# asked for 10, so it was never in the window to promote. When NOTHING
+# curated came back, one wider fetch is made and the result is reordered and
+# truncated; when a curated hit is already present — the common case — no
+# extra call happens at all. Bounded deliberately: this wave is cutting
+# daemon load, not adding to it.
+_WIDEN_FACTOR = 2
+_WIDEN_CAP = 40
+
+
+def _widen_when_nothing_curated(hits: list, n_results: int, fetch) -> list:
+    """One wider fetch when no curated document matched; else ``hits`` as-is.
+
+    ``fetch(limit)`` returns a fresh, already-normalised hit list (or None).
+    The widened list is annotated before it is returned so the caller can
+    rank it. A failed or unhelpful second call degrades to the original
+    hits — the extra fetch is an optimisation, never a dependency.
+    """
+    if not no_curated_source(hits):
+        return hits
+    widened_limit = min(n_results * _WIDEN_FACTOR, _WIDEN_CAP)
+    if widened_limit <= n_results:
+        return hits
+    try:
+        wider = fetch(widened_limit)
+    except DaemonError:
+        return hits
+    if not isinstance(wider, list) or len(wider) <= len(hits):
+        return hits
+    annotate(wider)
+    return wider
+
+
+def _fast_hits(query: str, limit: int, wing: str = None) -> list | None:
+    """GET /search/fast, normalised to the shared hit shape. None if unusable."""
+    rest_params = {"q": query, "limit": limit}
     if wing:
         rest_params["wing"] = wing
     raw = _call_daemon_rest("/search/fast", rest_params)
@@ -2634,8 +2672,20 @@ def _daemon_search_fast(query: str, n_results: int, wing: str = None) -> dict | 
             hit["bm25_score"] = round(hit.pop("rank"), 3)
         if hit.get("source_file"):
             hit["source"] = hit["source_file"]
+    return hits
+
+
+def _daemon_search_fast(query: str, n_results: int, wing: str = None) -> dict | None:
+    """BM25 fast path via GET /search/fast. Returns normalised data dict or None."""
+    hits = _fast_hits(query, n_results, wing)
+    if hits is None:
+        return None
     annotate(hits)
-    return {"results": hits, "query": query, "source": "bm25-fast"}
+    hits = _widen_when_nothing_curated(
+        hits, n_results, lambda limit: _fast_hits(query, limit, wing)
+    )
+    prefer_curated(hits)
+    return {"results": hits[:n_results], "query": query, "source": "bm25-fast"}
 
 
 def _daemon_search_hybrid(
@@ -2651,7 +2701,18 @@ def _daemon_search_hybrid(
     if data is None:
         return None
     data.setdefault("source", "hybrid")
-    annotate(data.get("results"))
+    hits = data.get("results")
+    annotate(hits)
+    if isinstance(hits, list):
+
+        def _refetch(limit):
+            wider_body = dict(body, limit=limit)
+            wider = _post_daemon_rest("/search/hybrid", wider_body)
+            return (wider or {}).get("results")
+
+        hits = _widen_when_nothing_curated(hits, n_results, _refetch)
+        prefer_curated(hits)
+        data["results"] = hits[:n_results]
     return data
 
 
@@ -2883,7 +2944,9 @@ def cmd_search(args):
 
             if data is None:
                 data = _call_daemon_tool("mempalace_search", arguments)
-                annotate(data.get("results") if isinstance(data, dict) else None)
+                results = data.get("results") if isinstance(data, dict) else None
+                annotate(results)
+                prefer_curated(results)
         except DaemonError as e:
             if want_json:
                 _emit_json({"error": str(e), "source": "daemon", "query": args.query})
