@@ -134,6 +134,141 @@ def gh_merge_commit_sha(pr: int, repo: str = REPO) -> str | None:
     return sha[:7] if isinstance(sha, str) and sha else None
 
 
+def git_file_add_commit(path: str, branch: str = "HEAD") -> str | None:
+    """The commit that ADDED ``path``, following renames.
+
+    For a fork-change entry this is the squash-merge commit by
+    construction: the entry file arrives with the pull request that
+    describes the change. No API call, no author bookkeeping, and immune
+    to a squash subject reworded at merge time — which defeated 4 of the
+    27 cases in the #472 sweep.
+    """
+    try:
+        out = _run(
+            [
+                "git",
+                "log",
+                "--follow",
+                "--diff-filter=A",
+                "--format=%H",
+                branch,
+                "--",
+                path,
+            ]
+        ).strip()
+    except subprocess.CalledProcessError:
+        return None
+    shas = [ln.strip() for ln in out.split("\n") if ln.strip()]
+    # A rename history can list several adds; the ORIGINAL add is last.
+    return shas[-1][:7] if shas else None
+
+
+def resolve_head_by_file_add(
+    entries: Iterable[dict],
+    branch: str = "HEAD",
+    adding_commit: Callable[[str, str], str | None] = git_file_add_commit,
+    fetch: Callable[[int], str | None] | None = None,
+    is_ancestor: Callable[[str, str], bool] = git_is_ancestor,
+    verify_ref: str = "origin/main",
+) -> tuple[list[tuple[dict, str]], list[tuple[dict, str]], list[tuple[dict, str]]]:
+    """Resolve ``commit: HEAD`` from the commit that added the entry file.
+
+    ⚠️ ONLY ever applied to an entry whose ``commit`` is exactly
+    ``HEAD``, and that boundary is load-bearing rather than an
+    optimisation. Every one of the 137 entry files that existed before
+    the one-file-per-entry split was created by the SPLIT's own commit,
+    so asking "what added this file" about an already-resolved entry
+    returns the migration commit — rewriting 137 correct historical
+    shas to a single wrong one. That wrong value would be an ancestor of
+    main, so it would pass the ancestry check forever and read as
+    correct. A test pins this boundary in both directions.
+
+    When the entry also carries ``fork_pr``, the API answer is used as a
+    CROSS-CHECK: if the two disagree the entry is reported rather than
+    resolved, because two independent mechanisms disagreeing is exactly
+    the case where guessing is least defensible.
+
+    A WRONG ``fork_pr`` therefore cannot produce a wrong sha. It either
+    points at another merged PR, whose different answer triggers the
+    refusal above, or it is unverifiable (nonexistent or unmerged), in
+    which case file-add stands alone and already has the right answer.
+    The second case is still wrong *documentation*, so it is surfaced as
+    a note rather than ignored -- a guessed number is how an entry
+    acquires a confidently wrong field.
+
+    Every candidate sha is checked against ``verify_ref``
+    (``origin/main``) before it can be written, and refused otherwise.
+    That is what makes a branch commit *impossible* to write rather than
+    merely unlikely: the ``--branch=origin/main`` default already made it
+    hard, but a default is an argument away from being wrong, and the
+    honest question here is not "which ref did you ask about" but "is
+    this commit actually on main". Asked about a feature branch,
+    ``git log --diff-filter=A`` truthfully returns the BRANCH commit —
+    which the squash orphans moments later (#472 through a new door).
+
+    Returns ``(changes, unresolved, notes)``. ``notes`` are advisory and
+    deliberately NOT folded into ``unresolved``: an advisory must not make
+    ``--check`` fail, or the next person silences the advisory.
+    """
+    changes: list[tuple[dict, str]] = []
+    unresolved: list[tuple[dict, str]] = []
+    notes: list[tuple[dict, str]] = []
+    for entry in entries:
+        if str(entry.get("commit", "")).strip() != "HEAD":
+            continue  # HARD BOUNDARY — see the docstring.
+        path = entry.get("_path")
+        if not path:
+            unresolved.append((entry, "no file path on the loaded entry"))
+            continue
+        sha = adding_commit(str(path), branch)
+        if not sha:
+            unresolved.append((entry, "could not find the commit that added the entry file"))
+            continue
+        pr = entry.get("fork_pr")
+        # Bound unconditionally: the advisory below reads `via_api`, and under
+        # the previous shape it was assigned only inside this block and stayed
+        # safe purely by short-circuit ORDER in that condition. Reordering the
+        # terms — a harmless-looking edit — would have made it a NameError.
+        # Cheaper to make the reorder safe than to forbid it in a comment.
+        via_api: str | None = None
+        if pr and fetch is not None:
+            try:
+                via_api = fetch(int(pr))
+            except (TypeError, ValueError):
+                via_api = None
+            if via_api and not (via_api.startswith(sha) or sha.startswith(via_api)):
+                unresolved.append(
+                    (
+                        entry,
+                        f"file-add says {sha} but PR #{pr} merge_commit_sha says "
+                        f"{via_api} — refusing to choose",
+                    )
+                )
+                continue
+        if not is_ancestor(sha, verify_ref):
+            # Refuse, never write. A sha that is not on main is either a
+            # branch commit (about to be orphaned by the squash) or a
+            # typo; both are the failure this mechanism exists to end.
+            unresolved.append(
+                (
+                    entry,
+                    f"{sha} is not an ancestor of {verify_ref} — refusing to write it "
+                    "(run the sweep against origin/main AFTER the merge)",
+                )
+            )
+            continue
+        if pr and fetch is not None and not via_api:  # safe in any term order now
+            # A `fork_pr` that cannot be verified is usually a number
+            # GUESSED before `gh pr create` returned. It cannot corrupt
+            # the result -- file-add already has the answer -- but it is
+            # wrong documentation, so say so instead of ignoring it.
+            notes.append(
+                (entry, f"resolved from file-add; fork_pr #{pr} is unverifiable — check it")
+            )
+        changes.append((entry, sha))
+    return changes, unresolved, notes
+
+
 def resolve_head_entries(
     entries: Iterable[dict],
     fetch: Callable[[int], str | None] = gh_merge_commit_sha,
@@ -270,11 +405,24 @@ def main(argv: list[str] | None = None) -> int:
     unresolved: list[tuple[dict, str]] = []
 
     if not args.no_resolve_head:
-        # Looked up on the module at call time (not bound as a default)
-        # so a test can substitute it and never touch the network.
-        c, u = resolve_head_entries(entries, fetch=gh_merge_commit_sha)
+        # PRIMARY: the commit that added the entry's own file. Deterministic,
+        # offline, and needs nothing from the author — a lane cannot know its
+        # PR number when it writes the entry, which is the same chicken-and-egg
+        # as the sha itself. `fork_pr` is a cross-check here, not the key.
+        c, u, notes = resolve_head_by_file_add(entries, args.branch, fetch=gh_merge_commit_sha)
         changes += c
         unresolved += u
+        for entry, why in notes:
+            print(f"  ~ {entry['id']}: {why}", file=sys.stderr)
+        # FALLBACK: anything file-add could not answer, try fork_pr via the API.
+        # Looked up on the module at call time (not bound as a default) so a
+        # test can substitute it and never touch the network.
+        still_head = [e for e, _ in u]
+        if still_head:
+            c2, u2 = resolve_head_entries(still_head, fetch=gh_merge_commit_sha)
+            changes += c2
+            unresolved = [(e, why) for e, why in unresolved if e not in [x for x, _ in c2]]
+            unresolved += u2
 
     if not args.no_repair:
         c, u = repair_dangling(entries, args.branch, legacy_ids=legacy)
