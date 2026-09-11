@@ -2374,6 +2374,7 @@ def mine(
     files: list = None,
     max_chunks_per_file: Optional[int] = None,
     workers: int = 1,
+    compute_derived: bool = True,
     *,
     collection=None,
     closets_collection=None,
@@ -2404,6 +2405,23 @@ def mine(
     caller (e.g. ``init`` showing a file-count estimate before the mine
     prompt) avoids walking the tree twice. When ``None`` (the default),
     ``mine`` walks the tree itself just like before.
+
+    The same block is ALSO skipped, with no flag, whenever the mine upserted
+    zero drawers. The count that matters is **drawers upserted, not files
+    processed**: since palace-daemon#262 most drain mines walk their files
+    and upsert nothing because the stored ``source_mtime`` still matches, so
+    a files-processed test would almost never fire. Measured on the palace
+    host, one such no-op mine still spent 14+ minutes at 3.5 GB here.
+
+    ``compute_derived`` controls the post-mine derived-analytics block
+    (cross-wing topic tunnels, within-wing hallways, cross-wing entity
+    tunnels). It defaults to ``True`` -- existing callers see no change.
+    Pass ``False`` when the mine is small and targeted: those three steps
+    cost O(wing), not O(change), so a hook-driven sweep of a handful of
+    files otherwise pays for the whole wing (#474 measured 29+ min of CPU
+    and 1.6-4.1 GB of RSS for a 31-file memory sweep, holding the
+    exclusive mine lock throughout). The drawers written are identical
+    either way; only the derived graph is left un-refreshed.
 
     ``max_chunks_per_file`` overrides the per-file chunk cap (see
     :func:`_resolve_max_chunks_per_file`). ``None`` defers to
@@ -2447,6 +2465,7 @@ def mine(
             files=files,
             max_chunks_per_file=max_chunks_per_file,
             workers=workers,
+            compute_derived=compute_derived,
             collection=collection,
             closets_collection=closets_collection,
         )
@@ -2469,6 +2488,7 @@ def mine(
             files=files,
             max_chunks_per_file=max_chunks_per_file,
             workers=workers,
+            compute_derived=compute_derived,
             collection=collection,
             closets_collection=closets_collection,
         )
@@ -2489,6 +2509,7 @@ def mine(
             files=files,
             max_chunks_per_file=max_chunks_per_file,
             workers=workers,
+            compute_derived=compute_derived,
         )
 
 
@@ -2606,6 +2627,7 @@ def _mine_impl(  # noqa: C901 — injected-handle branches push complexity one t
     files: list = None,
     max_chunks_per_file: Optional[int] = None,
     workers: int = 1,
+    compute_derived: bool = True,
     *,
     collection=None,
     closets_collection=None,
@@ -2786,57 +2808,89 @@ def _mine_impl(  # noqa: C901 — injected-handle branches push complexity one t
                 room_resolver=room_resolver,
             )
 
+        if not dry_run and compute_derived and not total_drawers:
+            print("\n  Derived graph: skipped — this mine filed no drawers")
+
         if not dry_run:
-            from .config import MempalaceConfig
+            # #474: these three derived analytics cost O(wing), not
+            # O(change). Measured on the palace host: a 31-file memory
+            # sweep spent 29+ min CPU and 1.6-4.1 GB RSS here, holding the
+            # exclusive mine lock with twelve more sweeps queued behind it.
+            # A sweep of a few memory files does not need the cross-wing
+            # graph at all, so the cheapest fix is to not do the work.
+            #
+            # All three are gated together on purpose: they are a chain
+            # (entity tunnels read the hallways the step above wrote), and
+            # skipping only the two tunnel steps would leave the hallways
+            # load + full rewrite -- most of the I/O -- in place.
+            #
+            # ``total_drawers == 0`` short-circuits without any flag: a mine
+            # that filed nothing has nothing to recompute for. Measured on
+            # the palace host, a requeued CLAUDE.md mine wrote zero drawers
+            # (every drawer still carried the earlier filed_at, so the
+            # stored-mtime check skipped the file) and still spent 14+
+            # minutes at 3.5 GB here. Note this is a TRADE, not a free win:
+            # ``_compute_entity_tunnels_for_wing`` reads every wing's
+            # hallways, so a no-op mine of wing A could in principle have
+            # picked up a cross-wing tunnel created by a mine of wing B.
+            # The next mine of A that actually files something -- or a full
+            # recompute -- picks it up, which is a fair price for not
+            # burning 14 minutes and 3.5 GB to rewrite identical output.
+            if compute_derived and total_drawers:
+                from .config import MempalaceConfig
 
-            graph_config = MempalaceConfig(palace_path=palace_path)
-            # Cross-wing topic tunnels: after every file in this wing has been
-            # processed, link this wing to any other wing that shares a
-            # confirmed TOPIC label. Out of scope for v1: manifest-dependency
-            # overlap, per-topic allow/deny lists, search-result surfacing.
-            try:
-                tunnels_added = _compute_topic_tunnels_for_wing(wing, config=graph_config)
-                if tunnels_added:
-                    print(f"\n  Topic tunnels: +{tunnels_added} cross-wing link(s)")
-            except Exception as e:
-                # Tunnel computation must never fail a mine — degrade quietly.
-                print(
-                    f"\n  WARNING: topic tunnel computation skipped — {e}",
-                    file=sys.stderr,
-                )
+                graph_config = MempalaceConfig(palace_path=palace_path)
+                # Cross-wing topic tunnels: after every file in this wing has been
+                # processed, link this wing to any other wing that shares a
+                # confirmed TOPIC label. Out of scope for v1: manifest-dependency
+                # overlap, per-topic allow/deny lists, search-result surfacing.
+                try:
+                    tunnels_added = _compute_topic_tunnels_for_wing(wing, config=graph_config)
+                    if tunnels_added:
+                        print(f"\n  Topic tunnels: +{tunnels_added} cross-wing link(s)")
+                except Exception as e:
+                    # Tunnel computation must never fail a mine — degrade quietly.
+                    print(
+                        f"\n  WARNING: topic tunnel computation skipped — {e}",
+                        file=sys.stderr,
+                    )
 
-            # Within-wing hallways: link entities (people, projects, concepts)
-            # that co-occur in drawers across this wing's rooms. Mirrors the
-            # tunnel-compute fault-tolerance pattern — hallway computation
-            # must never fail a mine; it's a derived analytic, not load-bearing
-            # for the drawer write that already committed above.
-            try:
-                hallways_created = compute_hallways_for_wing(
-                    wing, col=collection, config=graph_config
-                )
-                if hallways_created:
-                    print(f"\n  Hallways: +{len(hallways_created)} within-wing entity link(s)")
-            except Exception as e:
-                print(
-                    f"\n  WARNING: hallway computation skipped — {e}",
-                    file=sys.stderr,
-                )
+                # Within-wing hallways: link entities (people, projects, concepts)
+                # that co-occur in drawers across this wing's rooms. Mirrors the
+                # tunnel-compute fault-tolerance pattern — hallway computation
+                # must never fail a mine; it's a derived analytic, not load-bearing
+                # for the drawer write that already committed above.
+                try:
+                    hallways_created = compute_hallways_for_wing(
+                        wing, col=collection, config=graph_config
+                    )
+                    if hallways_created:
+                        print(f"\n  Hallways: +{len(hallways_created)} within-wing entity link(s)")
+                except Exception as e:
+                    print(
+                        f"\n  WARNING: hallway computation skipped — {e}",
+                        file=sys.stderr,
+                    )
 
-            # Cross-wing entity tunnels: derived from the hallway records
-            # materialized just above. When an entity appears in hallways of
-            # this wing AND another wing, a tunnel bridges them. Runs in
-            # parallel with topic tunnels — both kinds coexist via
-            # ``kind="entity"`` / ``kind="topic"``. Same fault-tolerance
-            # pattern: never fail a mine over a derived analytic.
-            try:
-                entity_tunnels_added = _compute_entity_tunnels_for_wing(wing, config=graph_config)
-                if entity_tunnels_added:
-                    print(f"\n  Entity tunnels: +{entity_tunnels_added} cross-wing entity link(s)")
-            except Exception as e:
-                print(
-                    f"\n  WARNING: entity tunnel computation skipped — {e}",
-                    file=sys.stderr,
-                )
+                # Cross-wing entity tunnels: derived from the hallway records
+                # materialized just above. When an entity appears in hallways of
+                # this wing AND another wing, a tunnel bridges them. Runs in
+                # parallel with topic tunnels — both kinds coexist via
+                # ``kind="entity"`` / ``kind="topic"``. Same fault-tolerance
+                # pattern: never fail a mine over a derived analytic.
+                try:
+                    entity_tunnels_added = _compute_entity_tunnels_for_wing(
+                        wing, config=graph_config
+                    )
+                    if entity_tunnels_added:
+                        print(
+                            f"\n  Entity tunnels: +{entity_tunnels_added} cross-wing entity link(s)"
+                        )
+                except Exception as e:
+                    print(
+                        f"\n  WARNING: entity tunnel computation skipped — {e}",
+                        file=sys.stderr,
+                    )
 
             if not injected_collection:
                 # Skip when the caller owns the client (issue #261). The

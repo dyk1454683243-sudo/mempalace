@@ -1969,6 +1969,17 @@ def cmd_mine(args):
         }
         if source_adapter:
             payload["source_adapter"] = source_adapter
+        if getattr(args, "no_tunnels", False):
+            # The job-queue daemon's mine payload has no tunnels field, and
+            # service.execute_job calls mine() without compute_derived — so
+            # the flag would be accepted here and the expensive derived-graph
+            # rebuild would run anyway. This branch returns before the
+            # daemon-strict warning below, so it needs its own (#474).
+            print(
+                "  WARN: --daemon ignores --no-tunnels: the job-queue mine payload "
+                "carries no tunnels field, so the derived-graph rebuild will still run",
+                file=sys.stderr,
+            )
         _submit_daemon_cli_job("mine", payload, args, background=getattr(args, "background", False))
         return
 
@@ -1988,6 +1999,13 @@ def cmd_mine(args):
             ignored_flags.append("--no-gitignore")
         if getattr(args, "include_ignored", None):
             ignored_flags.append("--include-ignored")
+        if getattr(args, "no_tunnels", False):
+            # The daemon's /mine body has no `tunnels` field yet
+            # (palace-daemon#262). Warn rather than accept the flag and
+            # quietly do the expensive thing anyway — a skip the operator
+            # asked for and did not get is worse than one they were told
+            # about. Drop this branch when the daemon forwards it.
+            ignored_flags.append("--no-tunnels")
         if ignored_flags:
             print(
                 f"  WARN: daemon-strict mode ignores these local-only flags: {', '.join(ignored_flags)}",
@@ -2081,6 +2099,7 @@ def cmd_mine(args):
                 include_ignored=include_ignored,
                 max_chunks_per_file=getattr(args, "max_chunks_per_file", None),
                 workers=getattr(args, "workers", 1),
+                compute_derived=not getattr(args, "no_tunnels", False),
             )
     except MineAlreadyRunning as exc:
         # A live MCP server or another mine is already writing to this
@@ -10006,6 +10025,19 @@ def main():  # noqa: C901 — merged fork daemon-routing + upstream hub-forward 
         help="Your name — recorded on every drawer (default: mempalace)",
     )
     p_mine.add_argument("--limit", type=int, default=0, help="Max files to process (0 = all)")
+    p_mine.add_argument(
+        "--no-tunnels",
+        action="store_true",
+        help=(
+            "Skip the post-mine derived-graph rebuild: cross-wing topic tunnels, "
+            "within-wing hallways, and cross-wing entity tunnels. Those cost "
+            "O(wing), not O(change), so a small targeted mine otherwise pays for "
+            "the whole wing. The drawers filed are identical either way; only the "
+            "derived graph is left un-refreshed until the next full mine. Note "
+            "the hallway rebuild is skipped too — entity tunnels are derived "
+            "from it, so the two cannot be separated"
+        ),
+    )
     p_mine.add_argument(
         "--redetect-origin",
         action="store_true",
