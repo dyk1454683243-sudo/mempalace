@@ -6498,6 +6498,62 @@ def _print_tunnels_table(bundle, scope_wing: str | None) -> None:
     print()
 
 
+def _rebuild_derived_graph(wing: str, palace_path=None) -> None:
+    """Recompute one wing's derived graph: topic tunnels, hallways, entity tunnels.
+
+    Delegates the three steps to ``miner.recompute_derived_graph``, which is
+    the single definition of what "the derived graph" means — the post-mine
+    block calls the same function, so a fourth step cannot land in one and be
+    forgotten in the other.
+
+    Takes the palace write lock. Hallways are a whole-file load / modify /
+    save that carries other wings forward from its OWN load, so a rebuild of
+    wing A racing a drain mine of wing B silently drops one side's new
+    records — whichever ``os.replace`` lands second wins, with no error.
+    """
+    from . import miner as _miner
+    from .config import MempalaceConfig, normalize_wing_name
+    from .palace import MineAlreadyRunning, mine_palace_lock
+
+    # The miner stores a normalized wing (``My-Project`` -> ``my_project``), so
+    # a raw slug here matches no drawers and reports a confident +0.
+    wing = normalize_wing_name(wing)
+
+    config = MempalaceConfig(palace_path=palace_path) if palace_path else MempalaceConfig()
+
+    print(f"\n  Rebuilding derived graph for wing '{wing}'")
+    collection = None
+    try:
+        # create=False: the default would MATERIALIZE a palace at a typo'd
+        # --palace and then report +0/+0/+0 success against the empty thing it
+        # just made. A rebuild must never create a palace.
+        collection = _miner.get_collection(config.palace_path, create=False)
+    except Exception as e:
+        # Hallways need the collection; the two tunnel steps do not, so this
+        # degrades to a partial rebuild rather than aborting.
+        print(f"  WARNING: could not open the palace collection — {e}", file=sys.stderr)
+
+    try:
+        with mine_palace_lock(config.palace_path):
+            result = _miner.recompute_derived_graph(wing, collection=collection, config=config)
+    except MineAlreadyRunning as exc:
+        # Another writer holds the palace. Surfacing this beats silently
+        # racing it and dropping half the hallways.
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    for key, noun, label in (
+        ("topic_tunnels", "topic tunnel", "Topic tunnels"),
+        ("hallways", "hallway", "Hallways"),
+        ("entity_tunnels", "entity tunnel", "Entity tunnels"),
+    ):
+        err = result["errors"].get(key)
+        if err is not None:
+            print(f"  WARNING: {noun} computation skipped — {err}", file=sys.stderr)
+        else:
+            print(f"  {label + ':':16}+{result[key]}")
+
+
 def cmd_tunnels(args):
     """List cross-wing tunnels (slice of #191).
 
@@ -6508,6 +6564,51 @@ def cmd_tunnels(args):
 
     Daemon unreachable → exit 1; inner-error envelope → exit 2.
     """
+    if getattr(args, "rebuild", False):
+        # Local operation — deliberately ahead of the daemon check below,
+        # which only the listing path needs.
+        if _daemon_strict() and not getattr(args, "palace", None):
+            # The palace lives on another host. Rebuilding the LOCAL one
+            # prints +0/+0/+0 and exits 0, so an operator who ran this
+            # BECAUSE the graph was stale is now told it is fresh. A
+            # confident wrong answer is worse than a refusal.
+            print(
+                "mempalace: tunnels --rebuild is a local operation and this client is "
+                "daemon-strict, so the palace it would rebuild is not the one you are "
+                f"reading from ({_daemon_url() or 'the palace daemon'}).",
+                file=sys.stderr,
+            )
+            print(
+                "mempalace: run it on the palace host, or pass --palace <dir> to rebuild "
+                "a local palace instead.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        if getattr(args, "all", False):
+            print(
+                "mempalace: tunnels --rebuild --all is not available. Rebuilding every "
+                "wing pays compute_hallways_for_wing's full load-and-rewrite of "
+                "hallways.json per wing — ~44s per wing at its current 1.2 GB, ~37 min "
+                "across 50 wings — which recreates the problem this verb exists to fix. "
+                "Pass --wing <slug>, or loop in the shell so the cost stays visible. "
+                "Tracked on #442 (hallways to a real store).",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        wing = getattr(args, "wing", None)
+        if not wing:
+            print(
+                "mempalace: tunnels --rebuild requires --wing <slug>. There is no "
+                "--all: rebuilding every wing pays compute_hallways_for_wing's full "
+                "load-and-rewrite of hallways.json per wing (~44s per wing at the "
+                "current 1.2 GB, ~37 min across 50 wings), which would recreate the "
+                "problem this verb exists to fix. See #442.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        _rebuild_derived_graph(wing, getattr(args, "palace", None))
+        return
+
     fmt = _resolve_tunnels_format(args)
     want_json = fmt == "json"
 
@@ -11368,6 +11469,27 @@ def main():  # noqa: C901 — merged fork daemon-routing + upstream hub-forward 
         help="List cross-wing tunnels (daemon mempalace_list_tunnels fast-path)",
     )
     p_tunnels.add_argument("--wing", default=None, help="Filter to tunnels touching one wing")
+    p_tunnels.add_argument(
+        "--all",
+        action="store_true",
+        help=(
+            "With --rebuild: refuse, with the measured reason. Accepted rather than "
+            "rejected by argparse so the answer explains itself (see #442)"
+        ),
+    )
+    p_tunnels.add_argument(
+        "--rebuild",
+        action="store_true",
+        help=(
+            "Recompute one wing's derived graph (topic tunnels, hallways, entity "
+            "tunnels) instead of listing. Requires --wing; runs locally, no daemon "
+            "needed. This is THE way to refresh the graph on purpose — since #474 "
+            "it otherwise refreshes only as a side effect of a full-directory mine "
+            "that files drawers. No --all by design: a whole-palace sweep rewrites "
+            "hallways.json once per wing (~37 min across 50 wings at its current "
+            "size), which is the problem this verb exists to fix"
+        ),
+    )
     p_tunnels.add_argument(
         "--passive",
         action="store_true",
