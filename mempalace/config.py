@@ -127,6 +127,47 @@ def sanitize_kg_value(value: str, field_name: str = "value") -> str:
     return strip_lone_surrogates(value)
 
 
+# Harness session ids are opaque tokens from whatever agent host wrote the
+# drawer (Claude Code sends a UUID). The charset deliberately mirrors the
+# live Stop/PreCompact hook's own ``_sanitize_session_id`` in
+# palace-daemon ``clients/hook.py`` -- that hook is the writer which
+# populates this field in practice, so a second, different rule here would
+# give the indexed key two shapes depending on which side normalised it.
+_SESSION_ID_STRIP_RE = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def sanitize_session_id(value) -> str:
+    """Reduce a harness session id to a safe, indexable token.
+
+    Returns ``""`` when nothing usable survives. Callers then *omit* the
+    metadata key rather than storing a placeholder: an absent key is
+    honest, whereas a synthetic ``"unknown"`` is a real id that matches
+    nothing and would pool unrelated sessions under one name.
+
+    Strips rather than raises, unlike ``sanitize_name``. ``session_id``
+    is a passenger on write paths whose whole job is to not lose a
+    memory, so a malformed id must degrade to "unattributed" and never
+    fail the write -- the same call ``tool_checkpoint`` already makes
+    when its dedup probe errors.
+    """
+    if not isinstance(value, str):
+        return ""
+    cleaned = _SESSION_ID_STRIP_RE.sub("", value)[:MAX_NAME_LENGTH]
+    # The hook's own fallback is ``return sanitized or "unknown"``, so it
+    # can hand us the literal placeholder. Mirroring its charset without
+    # mirroring this would store "unknown" as a real id and pool every
+    # session whose raw id sanitized to nothing under one name -- the
+    # precise harm the "omit, never substitute" rule above exists to
+    # prevent, reintroduced from the other side. Checked after the strip
+    # so "unknown!!" and padded variants collapse into it too.
+    #
+    # Deliberately narrow: the bare sentinel only, never a substring, so
+    # the guard cannot swallow a real id like "unknown-7f3a".
+    if cleaned.casefold() == "unknown":
+        return ""
+    return cleaned
+
+
 # ISO-8601 temporal validator for knowledge-graph temporal parameters
 # (as_of, valid_from, valid_to, ended).
 #
