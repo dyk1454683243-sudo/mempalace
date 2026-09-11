@@ -57,7 +57,7 @@ TechEmpower's production fork of [MemPalace/mempalace](https://github.com/MemPal
 
 ```bash
 source .venv/bin/activate
-python -m pytest tests/ -q              # 7125 tests (benchmarks deselected)
+python -m pytest tests/ -q              # full suite (benchmarks deselected)
 mempalace status                         # check palace state
 mempalace search "query"                 # test search
 python -m mempalace.mcp_server           # run MCP server standalone
@@ -69,7 +69,7 @@ Ruff for linting (`ruff check`), line length 100, target Python 3.9.
 
 Authoritative sources — don't duplicate inventory in this file. CLAUDE.md stays slim and architectural; in-flight state lives in the right tracker:
 
-- **Historical record of every fork-ahead change** — [`FORK_CHANGELOG.md`](FORK_CHANGELOG.md), rendered from canonical `docs/fork-changes.yaml`.
+- **Historical record of every fork-ahead change** — [`FORK_CHANGELOG.md`](FORK_CHANGELOG.md), rendered from canonical `docs/fork-changes/` (one file per entry).
 - **Open upstream PRs** — `gh pr list --repo MemPalace/mempalace --author jphein` (status table in README's "Fork change queue").
 - **In-flight fork work, todos, coordination promises** — [techempower-org/mempalace issues](https://github.com/techempower-org/mempalace/issues). Anything that would feel like a broken promise if forgotten belongs here, not in scratch and not inline in CLAUDE.md.
 - **Active session-scoped commitments** — `scratch/promises.md` (in-repo). Pruned aggressively; durable items migrate to issues.
@@ -121,27 +121,51 @@ Always run `python -m pytest tests/ -x -q` after changes. Benchmark and stress t
 The fork-ahead narrative was previously hand-maintained in four places
 (README's fork-change-queue table, this file's row inventory,
 `FORK_CHANGELOG.md`, and `scratch/promises.md`). Drift was inevitable.
-As of 2026-04-26 the **canonical source** is `docs/fork-changes.yaml`;
-render targets are generated. The inline row inventory in this file was
-retired 2026-05-11 — see [Fork-ahead state](#fork-ahead-state) above
-for current pointers.
+As of 2026-04-26 the **canonical source** is a manifest and every render
+target is generated; the inline row inventory here was retired
+2026-05-11 — see [Fork-ahead state](#fork-ahead-state) for current
+pointers.
+
+Since #473 that manifest is a **directory**, `docs/fork-changes/`, with
+**one file per entry**. It was a single `docs/fork-changes.yaml` whose
+`entries:` list every PR inserted at the top of, which made every PR in
+a wave conflict with every other one on that file and the four artefacts
+rendered from it — measured across a 10-PR wave with *zero* source
+conflicts. `docs/fork-changes/README.md` documents the schema, the
+ordering rule and why it is not a date sort; `scripts/fork_changes.py`
+is the loader every consumer goes through.
 
 ### Workflow for new fork-ahead changes
 
 1. Land the code change with a focused commit on `main`.
-2. Add an entry to `docs/fork-changes.yaml` (top of the `entries:`
-   list, newest first). Schema is documented at the top of the YAML.
-3. Run `scripts/render-docs.py` to regenerate `FORK_CHANGELOG.md`.
-4. Run `scripts/check-docs.sh` to verify nothing has drifted (test
-   count, commit hashes, render parity, upstream PR states).
-5. Commit the YAML + the regenerated `FORK_CHANGELOG.md` together.
+2. Add **one new file** under `docs/fork-changes/<date>-<id>.yaml`.
+   Schema and a template are documented at the top of
+   `scripts/fork_changes.py`. Two things matter:
+   - `seq:` — one above the current maximum
+     (`scripts/fork_changes.py --next-seq`). A collision with another
+     open PR is harmless: separate files, deterministic tie-break.
+   - `commit: HEAD` — **not** your branch sha. The squash-merge commit
+     does not exist yet, and a branch sha becomes unreachable from
+     `main` the moment the PR merges (#472). The merge step resolves it.
+   One file per entry means concurrent PRs no longer conflict here: a
+   10-PR wave on 2026-09-10/11 hit a conflict on every shared docs file
+   with zero source conflicts (#473).
+3. Run `scripts/render-docs.py` to regenerate `FORK_CHANGELOG.md` and
+   the README table.
+4. Run `scripts/check-docs.sh` to verify nothing has drifted (commit
+   hashes **and their ancestry**, render parity, upstream PR states).
+5. Commit your entry file + the regenerated artefacts together.
+
+After the PR merges, `scripts/maintain-fork-changes.py` resolves
+`commit: HEAD` to the squash sha — from `fork_pr:` via the GitHub API
+when present, otherwise by matching the commit subject.
 
 ### Targets
 
 | Target | Status |
 |--------|--------|
 | `FORK_CHANGELOG.md` | rendered from YAML (today) |
-| README fork-change-queue table | hand-maintained for now |
+| README fork-change-queue table | rendered from `docs/fork-changes/` (unnumbered since #473) |
 | `scratch/promises.md` (in-repo) | hand-maintained, kept short — durable items move to `techempower-org/mempalace` issues |
 | techempower-org/mempalace issues | hand-filed as work surfaces |
 
@@ -154,9 +178,19 @@ renderers land.
 Two CI workflows guard doc quality. `check-docs.yml` runs the semantic
 checks in `scripts/check-docs.sh`:
 
-1. README test count vs `pytest --collect-only`
-2. every fork commit hash referenced in docs resolves via `git cat-file -e`
-3. `FORK_CHANGELOG.md` matches the YAML (re-render idempotent)
+1. the test count, **derived** from `pytest --collect-only` and reported.
+   There is no committed literal to compare against: a number in README
+   and CLAUDE.md meant every test-adding PR edited the same two lines
+   (#473). A literal that creeps back is warned about, not failed.
+2. every fork commit hash referenced in prose resolves via
+   `git cat-file -e`
+2b. every **entry's** `commit:` is an *ancestor* of HEAD (#472).
+   Resolving is not enough — a rebase or squash rewrites the commit, the
+   entry keeps the old sha, and `cat-file -e` still passes on the
+   dangling object. Entries that genuinely cannot be resolved are listed
+   as `<id> <sha>` pairs in `docs/fork-changes-legacy-shas.txt` and
+   skipped only for that exact pair.
+3. `FORK_CHANGELOG.md` matches `docs/fork-changes/` (re-render idempotent)
 4. every `#NNNN` reference has an upstream state matching the doc's claim
 
 Run `scripts/check-docs.sh` before committing any doc change. Exit
