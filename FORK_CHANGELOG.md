@@ -24,6 +24,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 
+- **Every search hit carries source_kind (+ staleness when decidable) and the CLI renders the caveat** ([`5632dc2`](https://github.com/techempower-org/mempalace/commit/5632dc2))
+  A palace search returns the *indexed copy* of whatever was mined, and
+  transcripts are the only thing mined continuously (the Stop / PreCompact
+  hooks); curated project documents are re-indexed only by a manual
+  ``mempalace mine``. So the copy that comes back for a project fact is
+  usually a session transcript quoting a claim, never the document that
+  later corrected it — and nothing on the hit said which of the two the
+  reader was holding. Measured: ``2g/CLAUDE.md`` gained a
+  ``FIVE HANDSETS REFUSE THIS NETWORK`` headline on 2026-09-03 and a
+  REFUTED banner on 2026-09-05, while the indexed card is dated 2026-09-01
+  and contains neither; a wing-wide keyword query at limit 40 returned 21
+  hits (20 ``.jsonl``, 1 diary, 0 ``CLAUDE.md``). Two peer sessions read
+  the transcript copy as current.
+
+  New ``mempalace/provenance.py`` classifies each hit as
+  ``transcript`` / ``memory`` / ``diary`` / ``file`` / ``unknown`` and,
+  when the source is an absolute path that exists locally, whether the
+  file has been modified since it was indexed. ``source_stale`` returns
+  ``None`` for undecidable — a daemon hit carries a basename only, so it
+  can never be located — and that is explicitly not a denial of
+  staleness. ``annotate()`` stamps the fields at every result-assembly
+  site: the CLI's fast / hybrid / MCP-envelope routes and all three
+  ``searcher`` sites, so MCP ``mempalace_search`` carries them from the
+  daemon host too. ``--format table`` prints the caveat under each hit,
+  ``compact`` tags it with the source shape, and the header says so when
+  nothing curated matched at all.
+
+  The staleness CAVEAT is deliberately not rendered for transcripts, only
+  the field. Measured over 48 production transcript hits: 15 stale, 21
+  not, 12 undecidable — but a live session's transcript is appended to
+  continuously, so any wing with an open session reads stale and the note
+  would fire constantly while saying nothing the transcript caveat
+  already says. Staleness is the signal that matters for a curated
+  document, which is the #451 case: a project ``CLAUDE.md`` that grew a
+  REFUTED banner after its drawer was indexed.
+  ``auto_query.runner._is_curated`` now delegates to the same predicate,
+  so the ranking that prefers curated hits and the caveat the CLI prints
+  cannot disagree about which hits are curated.
+
+  *Tests:* 65 (test_provenance x52, test_cli_daemon TestCmdSearchProvenance x12, test_hnsw_capacity provenance x1)
+  *Files:* `mempalace/provenance.py`, `mempalace/cli.py`, `mempalace/searcher.py`, `mempalace/auto_query/runner.py`
+
+
 - **mempalace mine <file> --mode projects — targeted re-index of one curated document** ([`787af46`](https://github.com/techempower-org/mempalace/commit/787af46))
   Projects mode required a directory, so refreshing one edited ``CLAUDE.md``
   meant re-mining the whole tree and holding the palace write lock for as
