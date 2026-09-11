@@ -1735,6 +1735,72 @@ def _mine_via_adapter(args) -> None:
     print(f"  Filed {drawer_count} drawers from {item_count} items.\n")
 
 
+def _derive_daemon_mine_wing(directory: str, raw_arg: str) -> str:
+    """Wing for a daemon-strict mine when ``--wing`` was omitted.
+
+    Matches local-mine semantics: a directory is its own wing, and a single
+    file takes its PROJECT's wing rather than its own name (#451) — so
+    ``~/Projects/2g/CLAUDE.md`` is wing ``2g``.
+
+    The catch is that this runs on the CLIENT while the daemon mines ITS
+    host's copy, which may exist where ours does not (synced, or remapped by
+    ``PALACE_DAEMON_PATH_MAP``). A path we cannot classify locally is not
+    "wrong", it is unknown — and the two rules disagree about it.
+
+    The disagreement is one-sided, which is what makes this tractable:
+
+    * for a DIRECTORY the rule is "basename", which is right whether or not
+      we can see it. ``/home/u/proj`` is wing ``proj`` from anywhere.
+    * for a FILE the wing comes from somewhere else entirely (its project
+      root), so falling back to "basename" yields the FILENAME: measured,
+      ``~/Projects/2g/CLAUDE.md`` lands in a wing called ``claude.md``.
+
+    So only a file misfiles, and this refuses exactly when the unresolvable
+    path looks like a document — a suffix the miner reads as text. Anything
+    else keeps the historic directory rule, which
+    ``tests/test_cli_daemon.py::TestCmdMineDaemon::test_routes_projects_mode_to_daemon``
+    has pinned since before single-file mining existed: a remote-only path,
+    no ``--wing``, exit 0.
+
+    Residual hole, stated rather than papered over: a remote-only file with
+    NO suffix (``Makefile``, ``CHANGELOG``) is indistinguishable from a
+    directory here and still takes the basename rule. Pass ``--wing`` for
+    those. Closing it would mean refusing every unresolvable path, which
+    breaks the contract above.
+    """
+    from .config import normalize_wing_name
+
+    wing_source = Path(directory)
+    if wing_source.is_file():
+        from .miner import resolve_project_root
+
+        wing_source = resolve_project_root(wing_source)
+    elif not wing_source.is_dir() and _looks_like_a_document(wing_source):
+        print(
+            f"mempalace: cannot derive a wing for {raw_arg} — it looks like a document but "
+            "does not exist on THIS machine, so its project (which is where a file's wing "
+            "comes from) cannot be resolved here. Deriving the wing from the path would "
+            f"file it under {normalize_wing_name(wing_source.name)!r}. Pass --wing <slug>.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return normalize_wing_name(wing_source.name)
+
+
+def _looks_like_a_document(path: Path) -> bool:
+    """True when ``path``'s suffix is one the project miner reads as text.
+
+    Only used to decide whether an unresolvable path is file-shaped enough to
+    refuse a guessed wing for. Reuses the miner's own whitelist so the answer
+    tracks what mining actually accepts.
+    """
+    try:
+        from .miner import READABLE_EXTENSIONS
+    except Exception:  # pragma: no cover — miner import is not optional in practice
+        return bool(path.suffix)
+    return path.suffix.lower() in READABLE_EXTENSIONS
+
+
 def cmd_mine(args):
     from .palace import MineAlreadyRunning, MineValidationError
 
@@ -1768,6 +1834,22 @@ def cmd_mine(args):
         suffix = " would be written" if args.dry_run else " written"
         print(f"  Source adapter {source_adapter!r}: {drawers_written} drawer(s){suffix}.")
         return
+
+    # A .jsonl handed to projects mode is a mode mistake, not a mine: projects
+    # mode would chunk raw JSON as prose, and until #451 made projects mode
+    # accept a file at all it was silently a no-op (scan_project walks a file
+    # and finds nothing). Name the mode that does work and exit 2, the same
+    # usage-error code the --source dispatch above uses. A DIRECTORY whose
+    # name happens to end in .jsonl is still a directory mine.
+    _mine_target = Path(os.path.expanduser(args.dir))
+    if mode == "projects" and _mine_target.suffix.lower() == ".jsonl" and not _mine_target.is_dir():
+        print(
+            f"mempalace: {args.dir} is a .jsonl transcript; projects mode files it as "
+            "prose, not as exchanges. Use --mode convos (one drawer per exchange) "
+            "or --mode session (one manifest drawer per file).",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     # Explicit --daemon submits to the opt-in local job-queue daemon
     # (upstream #1783 family). This is a deliberate user request and takes
@@ -1821,13 +1903,7 @@ def cmd_mine(args):
             )
 
         directory = os.path.abspath(os.path.expanduser(args.dir))
-        wing = args.wing
-        if not wing:
-            # Match local-mine semantics: derive wing from directory name
-            # the same way miner / convo_miner do when --wing is omitted.
-            from .config import normalize_wing_name
-
-            wing = normalize_wing_name(Path(directory).name)
+        wing = args.wing or _derive_daemon_mine_wing(directory, args.dir)
         ok = _post_daemon_mine_cli(directory, wing=wing, mode=args.mode)
         sys.exit(0 if ok else 1)
 
@@ -9450,7 +9526,13 @@ def main():  # noqa: C901 — merged fork daemon-routing + upstream hub-forward 
     # mine
     p_mine = sub.add_parser("mine", help="Mine files into the palace")
     p_mine.add_argument(
-        "dir", help="Directory to mine, or one conversation file with --mode convos"
+        "dir",
+        help=(
+            "Directory to mine, one file (projects mode mines just that file — a "
+            "targeted re-index that replaces its existing drawers; against a daemon "
+            "this needs one carrying palace-daemon#258, older daemons reject a "
+            "non-.jsonl file with a 400), or one conversation file with --mode convos"
+        ),
     )
     p_mine.add_argument(
         "--backend",
