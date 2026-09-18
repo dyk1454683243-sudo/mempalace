@@ -3,6 +3,7 @@ id: window-and-source-verbs
 date: '2026-09-17'
 bucket: Added
 commit: HEAD
+fork_pr: 512
 area: CLI
 summary: "`mempalace window` walks a wing chronologically; `mempalace source` lists one file's drawers in order"
 body: |
