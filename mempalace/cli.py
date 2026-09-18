@@ -126,6 +126,31 @@ class DaemonError(RuntimeError):
     """Raised when a daemon HTTP call fails or returns a JSON-RPC error."""
 
 
+class DaemonRequestError(DaemonError):
+    """The daemon answered and REFUSED the request — a 4xx, not an outage.
+
+    A subclass so every existing `except DaemonError` keeps working; call
+    sites that can tell the operator something useful catch this first.
+
+    The distinction is the whole of #499: one exception type meant a client
+    could not tell "the palace is down" from "your argument is wrong", and it
+    guessed the former. `mempalace list --room diary` reported "palace daemon
+    unreachable … see mempalace status" while the daemon was up and had
+    answered with, verbatim:
+
+        {"detail": {"error": "room 'diary' is not in the canonical set",
+                    "valid_rooms": [...]}}
+
+    The message the operator needed had already arrived. `detail` carries it
+    forward so the client stops substituting a guess for it.
+    """
+
+    def __init__(self, message: str, *, status: int, detail=None):
+        super().__init__(message)
+        self.status = status
+        self.detail = detail
+
+
 def _print_retired_local_palace_or_default(palace_path: str) -> None:
     """If the user's default palace is missing AND a RETIRED marker
     exists, print the marker's content as the not-found message — so
@@ -231,6 +256,60 @@ def _call_daemon_tool(name: str, arguments: dict) -> dict:
         return {"_raw": text}
 
 
+def _daemon_error_detail(exc) -> str:
+    """The daemon's own explanation for a refusal, as plain text.
+
+    FastAPI returns ``{"detail": ...}`` where detail is a string or a dict;
+    the room validator uses a dict with ``error`` and ``valid_rooms``, which
+    is exactly the guidance the operator needs. Anything unparseable falls
+    back to the raw body, and an unreadable body to "" — this runs while
+    already reporting a failure and must not raise a second one.
+    """
+    try:
+        raw = exc.read().decode("utf-8", errors="replace").strip()
+    except Exception:  # noqa: BLE001 — the body is best-effort
+        return ""
+    if not raw:
+        return ""
+    try:
+        detail = json.loads(raw).get("detail", raw)
+    except (ValueError, AttributeError):
+        return raw[:300]
+    if isinstance(detail, dict):
+        text = str(detail.get("error") or detail)
+        options = detail.get("valid_rooms") or detail.get("valid")
+        if options:
+            text = f"{text} (valid: {', '.join(map(str, options))})"
+        return text[:300]
+    return str(detail)[:300]
+
+
+def _exit_daemon_request_error(e, *, want_json: bool, source: str = "daemon"):
+    """Report a daemon REFUSAL and exit 64 (bad args), never as an outage.
+
+    One renderer for every REST call site, because there were five of them
+    and every one reported the same wrong thing. Fixing only the one named
+    in #499 is the shape that produced #459 three weeks after #418: two of
+    four call sites corrected, the rest found later by an audit.
+
+    Exit 64 is `cli.py`'s documented code for bad args; each site keeps its
+    own (differing) code for a genuine outage, which this deliberately does
+    not touch.
+    """
+    if want_json:
+        _emit_json(
+            {
+                "error": "bad_request",
+                "status": e.status,
+                "detail": e.detail or str(e),
+                "source": source,
+            }
+        )
+    else:
+        print(f"daemon rejected the request ({e.status}): {e}", file=sys.stderr)
+    sys.exit(64)
+
+
 def _call_daemon_rest(path: str, params: dict | None = None) -> dict:
     """GET a daemon REST endpoint directly — no MCP envelope, no AGE locks.
 
@@ -255,6 +334,20 @@ def _call_daemon_rest(path: str, params: dict | None = None) -> dict:
     except urllib.error.HTTPError as e:
         if e.code in (404, 401, 403):
             return None  # endpoint missing or auth mismatch — caller falls back to MCP
+        if 400 <= e.code < 500:
+            # The daemon answered and refused. Its body already says WHY —
+            # FastAPI puts it in `detail` — and discarding it is what made
+            # `list --room diary` report the daemon unreachable while it was
+            # up and explaining itself (#499).
+            detail = _daemon_error_detail(e)
+            # The message is the daemon's EXPLANATION; the status is a field.
+            # Keeping the code out of the string means a renderer composes it
+            # once from `status` rather than depending on how the string was
+            # built — a test that constructed this directly caught exactly
+            # that coupling.
+            raise DaemonRequestError(
+                detail or e.reason or f"HTTP {e.code}", status=e.code, detail=detail
+            ) from e
         raise DaemonError(f"daemon REST {path} failed ({e.code}): {e.reason}") from e
     except (urllib.error.URLError, ConnectionError, OSError) as e:
         raise DaemonError(f"daemon unreachable at {_daemon_url()}: {e}") from e
@@ -3178,6 +3271,9 @@ def cmd_list(args):
 
     try:
         data = _call_daemon_rest("/list", params)
+    except DaemonRequestError as e:
+        # The daemon answered and refused: say what IT said (#499).
+        _exit_daemon_request_error(e, want_json=want_json)
     except DaemonError as e:
         # Match cmd_status's daemon-down fallback (line 2230) and the
         # graceful 401/403 + unreachable handling added in 850e08c. On
@@ -3422,6 +3518,9 @@ def _gather_bulk_move_matches(wing, room, want_json):
             params["room"] = room
         try:
             data = _call_daemon_rest("/list", params)
+        except DaemonRequestError as _req_err:
+            # A refusal is not an outage (#499).
+            _exit_daemon_request_error(_req_err, want_json=want_json)
         except DaemonError as e:
             if want_json:
                 _emit_json({"error": str(e), "source": "daemon"})
@@ -3872,6 +3971,9 @@ def cmd_graph(args):
 
     try:
         data = _call_daemon_rest("/graph", params)
+    except DaemonRequestError as _req_err:
+        # A refusal is not an outage (#499).
+        _exit_daemon_request_error(_req_err, want_json=want_json)
     except DaemonError as e:
         # Match cmd_list / cmd_status daemon-down fallback. JSON callers
         # get a structured error on stdout; humans get the standard
@@ -4972,38 +5074,111 @@ def cmd_rename_wing(args):
         print()
 
 
+# How many queued sources the plan names per wing before summarising.
+_PENDING_PLAN_SAMPLE = 5
+
+
+def _print_pending_plan(planned: list, *, want_json: bool) -> None:
+    """Say what a drain would post, in the caller's chosen shape."""
+    if want_json:
+        _emit_json({"dry_run": True, "pending": len(planned), "requests": planned})
+        return
+    n = len(planned)
+    print(f"\n  mempalace pending drain — {n} queued mine request(s) would be posted\n")
+    by_wing: dict = {}
+    for request in planned:
+        by_wing.setdefault(request.get("wing") or "(no wing)", []).append(request)
+    for wing in sorted(by_wing):
+        rows = by_wing[wing]
+        print(f"  wing {wing}  ({len(rows)})")
+        for request in rows[:_PENDING_PLAN_SAMPLE]:
+            source = str(request.get("dir") or "?")
+            print(f"    {request.get('mode', 'convos'):<8} {source}")
+        if len(rows) > _PENDING_PLAN_SAMPLE:
+            print(f"    … and {len(rows) - _PENDING_PLAN_SAMPLE} more")
+    print("\n  Nothing has been posted. Re-run with --yes to drain the queue.\n")
+
+
+def cmd_pending(args):
+    """Dispatch the ``pending`` verb group."""
+    action = getattr(args, "pending_action", None)
+    if action == "drain":
+        cmd_pending_drain(args)
+        return
+    print(
+        "mempalace pending: choose an action (drain). See `mempalace pending --help`.",
+        file=sys.stderr,
+    )
+    sys.exit(64)
+
+
 def cmd_replay(args):
-    """Drain ``~/.mempalace/pending/*.jsonl`` by re-issuing each request to the daemon.
+    """Deprecated alias for ``pending drain`` — warns, then defers.
 
-    Pending requests accumulate when the Stop / PreCompact hooks fire while
-    the daemon (or its backend) is unreachable — see the 2026-05-21
-    power-resilience design. Drain semantics:
-
-    * Each line is one ``{"dir", "wing", "mode", "ts"}`` mine request.
-    * On 2xx daemon response the line is consumed; on failure the line
-      stays in the file for the next attempt.
-    * Duplicate ``(dir, wing, mode)`` tuples are deduped before transmit
-      so a long outage doesn't replay the same target N times.
+    Kept because scripts and a cron entry call it. The name is the bug
+    (#498): "replay" reads as replaying history, while it posts mine jobs.
+    It inherits the ``--yes`` guard rather than routing around it, so the
+    alias is not a back door to the old behaviour.
     """
+    print(
+        "mempalace replay: renamed to `mempalace pending drain` — "
+        "it drains the pending MINE queue, it does not replay history (#498).",
+        file=sys.stderr,
+    )
+    cmd_pending_drain(args)
+
+
+def cmd_pending_drain(args):
+    """Re-post every queued mine request to the daemon — after saying so.
+
+    ``~/.mempalace/pending/*.jsonl`` accumulates mine requests whenever the
+    Stop / PreCompact hooks fire while the daemon or its backend is
+    unreachable (the 2026-05-21 power-resilience design). Draining it
+    re-posts each one.
+
+    **Defaults to a plan.** The verb this replaced, ``replay``, took no
+    arguments, printed no description, and posted everything immediately: a
+    2026-09-17 session reading it as "replay history" queued twelve mines
+    against production (#498). Nothing is posted without ``--yes``.
+
+    The plan comes from :func:`pending_queue.peek`, which reproduces the
+    drain's own filtering rather than counting lines, so the number printed
+    is the number that would be posted. A preview that over-counted would be
+    the same defect this command was filed for.
+    """
+    want_json = getattr(args, "json", False)
+
     if not _daemon_strict():
-        print(
-            "mempalace replay: nothing to do (PALACE_DAEMON_URL not set or strict mode off).",
-            file=sys.stderr,
-        )
-        return 0
+        msg = "nothing to do (PALACE_DAEMON_URL not set or strict mode off)"
+        if want_json:
+            _emit_json({"error": msg, "pending": 0})
+        else:
+            print(f"mempalace pending drain: {msg}", file=sys.stderr)
+        sys.exit(0)
 
     try:
         from . import pending_queue
-    except Exception as e:
-        print(f"  ERROR: could not import pending_queue: {e}", file=sys.stderr)
-        return 1
+    except Exception as e:  # noqa: BLE001 — user-facing CLI guard
+        if want_json:
+            _emit_json({"error": f"could not import pending_queue: {e}"})
+        else:
+            print(f"  ERROR: could not import pending_queue: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    planned = pending_queue.peek()
+    if not planned:
+        if want_json:
+            _emit_json({"dry_run": not getattr(args, "yes", False), "pending": 0, "requests": []})
+        else:
+            print("mempalace pending drain: the pending queue is empty.")
+        sys.exit(0)
+
+    if not getattr(args, "yes", False):
+        _print_pending_plan(planned, want_json=want_json)
+        sys.exit(0)
 
     def post(request: dict) -> bool:
-        # _post_daemon_mine_cli doesn't share the hook's pending-queue
-        # re-enqueue path, so skip_queue isn't applicable here; the
-        # CLI variant prints to stderr and returns bool unconditionally.
-        #
-        # ``background=True`` is what makes a replay a drain rather than a
+        # ``background=True`` is what makes a drain a drain rather than a
         # crawl: a synchronous /mine waits for a gap in the palace write
         # lock, and under checkpoint load those gaps are minutes apart
         # (measured: 120 s, one request drained, #456). The daemon's own
@@ -5018,16 +5193,26 @@ def cmd_replay(args):
         )
 
     report = pending_queue.replay(post)
-    if report.is_empty:
-        print("mempalace replay: pending queue is empty.")
-        return 0
-
-    print(
-        f"mempalace replay: attempted={report.attempted} "
-        f"succeeded={report.succeeded} failed={report.failed} "
-        f"files_drained={report.files_drained}"
-    )
-    return 0 if report.failed == 0 else 1
+    if want_json:
+        _emit_json(
+            {
+                "dry_run": False,
+                "attempted": report.attempted,
+                "succeeded": report.succeeded,
+                "failed": report.failed,
+                "files_drained": report.files_drained,
+            }
+        )
+    else:
+        print(
+            f"mempalace pending drain: attempted={report.attempted} "
+            f"succeeded={report.succeeded} failed={report.failed} "
+            f"files_drained={report.files_drained}"
+        )
+    # sys.exit, not return: `main` discards a handler's return value, so the
+    # old `return 1` never reached the shell and a wholly failed drain still
+    # exited 0. Tracked separately; these paths do not wait for it.
+    sys.exit(0 if report.failed == 0 else 1)
 
 
 def cmd_migrate_wings(args):
@@ -5944,6 +6129,9 @@ def cmd_stats(args):
 
     try:
         data = _call_daemon_rest("/stats")
+    except DaemonRequestError as _req_err:
+        # A refusal is not an outage (#499).
+        _exit_daemon_request_error(_req_err, want_json=want_json)
     except DaemonError as e:
         if want_json:
             _emit_json({"error": str(e), "source": "daemon"})
@@ -9759,6 +9947,9 @@ def cmd_wings(args):
     if _daemon_strict() and not getattr(args, "palace", None):
         try:
             fast = _call_daemon_rest("/status/fast")
+        except DaemonRequestError as _req_err:
+            # A refusal is not an outage (#499).
+            _exit_daemon_request_error(_req_err, want_json=want_json)
         except DaemonError as e:
             _read_family_fail(
                 f"palace daemon unreachable at {_daemon_url()} ({e})", want_json, 1, "daemon"
@@ -11503,9 +11694,42 @@ def main():  # noqa: C901 — merged fork daemon-routing + upstream hub-forward 
         help="Storage backend (default: config/env/detected/chroma)",
     )
 
-    sub.add_parser(
+    # `pending drain` is the primary name; `replay` stays as a warning alias
+    # because scripts and a cron entry call it. The old name read as
+    # "replay history" and the command posts mine jobs (#498).
+    _PENDING_DESC = (
+        "Drain the pending MINE queue: re-post each request in "
+        "~/.mempalace/pending/ to the daemon as a mine job. Prints a plan and "
+        "posts nothing unless --yes is given."
+    )
+    p_pending = sub.add_parser(
+        "pending",
+        help="Inspect or drain the pending mine queue (~/.mempalace/pending/)",
+        description=_PENDING_DESC,
+    )
+    pending_sub = p_pending.add_subparsers(dest="pending_action")
+    p_pending_drain = pending_sub.add_parser(
+        "drain",
+        help="Re-post queued mine requests to the daemon (plan only without --yes)",
+        description=_PENDING_DESC,
+    )
+    p_pending_drain.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Actually post the queued requests (without this, only a plan is printed)",
+    )
+
+    p_replay = sub.add_parser(
         "replay",
-        help="Drain ~/.mempalace/pending/ by re-issuing queued mine requests to the daemon",
+        help="Deprecated alias for `pending drain` — drains the pending MINE queue",
+        description=_PENDING_DESC + " Deprecated alias for `mempalace pending drain`.",
+    )
+    p_replay.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Actually post the queued requests (without this, only a plan is printed)",
     )
 
     p_mined = sub.add_parser(
@@ -12436,6 +12660,7 @@ def main():  # noqa: C901 — merged fork daemon-routing + upstream hub-forward 
         "why": cmd_why,
         "tunnels": cmd_tunnels,
         "mined": cmd_mined,
+        "pending": cmd_pending,
         "replay": cmd_replay,
         # read family — slices of #191 (issues #356, #360, #362)
         "wings": cmd_wings,
